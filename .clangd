@@ -1,0 +1,2 @@
+CompileFlags:                     # Tweak the parse settings
+  Remove: [--generate-code*, -forward-unknown-to-host-compiler]
