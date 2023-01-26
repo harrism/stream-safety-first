@@ -1,11 +1,14 @@
 #define CATCH_CONFIG_MAIN
-#define CATCH_CONFIG_FAST_COMPILE
+
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
 #include <catch2/catch.hpp>
 
 #include <algorithm>
 #include <numeric>
 #include <vector>
+
+namespace {
 
 __global__ void kernel(int* input, int* output, int n, int iterations = 1000)
 {
@@ -16,6 +19,25 @@ __global__ void kernel(int* input, int* output, int n, int iterations = 1000)
     }
   }
 }
+
+class device_buffer {
+ public:
+  device_buffer(std::size_t size, cudaStream_t stream) : _size(size), _stream(stream)
+  {
+    cudaMallocAsync(&_data, _size, _stream);
+  }
+
+  ~device_buffer() { cudaFreeAsync(_data, _stream); }
+
+  void* data() { return _data; }
+
+ private:
+  void* _data{};
+  std::size_t _size;
+  cudaStream_t _stream;
+};
+
+}  // namespace
 
 class DataRaceFixture {
  protected:
@@ -191,6 +213,91 @@ TEST_CASE_METHOD(DataRaceFixture, "Use after free", "[example_2]")
     cudaFreeAsync(racer, stream_a);
 
     cudaStreamSynchronize(stream_b);
+    REQUIRE(h_output == h_reference);
+  }
+}
+
+TEST_CASE_METHOD(DataRaceFixture, "device_buffer use-after-free", "[example_3]")
+{
+  SECTION("Unsafe: RAII device_buffer use after free")
+  {
+    device_buffer output(bytes, stream_a);
+
+    {
+      device_buffer input(bytes, stream_a);
+      cudaMemcpyAsync(input.data(), h_input.data(), bytes, cudaMemcpyDefault, stream_a);
+      cudaStreamSynchronize(stream_a);
+      kernel<<<num_blocks, block_sz, 0, stream_b>>>(
+        static_cast<int*>(input.data()), static_cast<int*>(output.data()), n);
+    }
+
+    // input is out of scope and therefore its memory could be reused on stream_a
+    // meanwhile kernel may still be reading from it on stream_b...
+
+    {
+      // This exercises the use-after-free. It is not guaranteed to reproduce on all systems.
+      // However, on CUDA 11.5 with a Quadro GV100 (16GB) the memory allocated overlaps foo and
+      // the allocation and memset are fast enough to overlap the `kernel` on `stream_b`
+      // above
+      device_buffer racer(100 * bytes, stream_a);
+      cudaMemsetAsync(racer.data(), 0xcc, 100 * bytes, stream_a);
+    }
+
+    cudaMemcpyAsync(h_output.data(), output.data(), bytes, cudaMemcpyDefault, stream_b);
+    cudaStreamSynchronize(stream_b);
+    REQUIRE(h_output == h_reference);  // Technically this could fail
+  }
+
+  SECTION("Safe: synchronize streams before and after cross-stream use.")
+  {
+    device_buffer output(bytes, stream_a);
+
+    {
+      device_buffer input(bytes, stream_a);
+      cudaMemcpyAsync(input.data(), h_input.data(), bytes, cudaMemcpyDefault, stream_a);
+      cudaStreamSynchronize(stream_a);
+      kernel<<<num_blocks, block_sz, 0, stream_b>>>(
+        static_cast<int*>(input.data()), static_cast<int*>(output.data()), n);
+      cudaStreamSynchronize(stream_b);
+    }
+
+    // input is out of scope, but only after the kernel finished writing to output.
+
+    {
+      // Since there is no use-after-free, this code cannot overwrite the contents of `output` as in
+      // the `UseAfterFree` test.
+      device_buffer racer(100 * bytes, stream_a);
+      cudaMemsetAsync(racer.data(), 0xcc, 100 * bytes, stream_a);
+    }
+
+    cudaMemcpyAsync(h_output.data(), output.data(), bytes, cudaMemcpyDefault, stream_a);
+    cudaStreamSynchronize(stream_a);
+    REQUIRE(h_output == h_reference);
+  }
+
+  SECTION("Safe: RAII device_buffer used on same stream as it is freed")
+  {
+    device_buffer output(bytes, stream_a);
+
+    {
+      device_buffer input(bytes, stream_a);
+      cudaMemcpyAsync(input.data(), h_input.data(), bytes, cudaMemcpyDefault, stream_a);
+      kernel<<<num_blocks, block_sz, 0, stream_a>>>(
+        static_cast<int*>(input.data()), static_cast<int*>(output.data()), n);
+    }
+
+    // input is out of scope, but kernel and memcpy ran on the same stream so no synchronization
+    // necessary
+
+    {
+      // Since there is no use-after-free, this code cannot overwrite the contents of `output` as in
+      // the `UseAfterFree` test.
+      device_buffer racer(100 * bytes, stream_a);
+      cudaMemsetAsync(racer.data(), 0xcc, 100 * bytes, stream_a);
+    }
+
+    cudaMemcpyAsync(h_output.data(), output.data(), bytes, cudaMemcpyDefault, stream_a);
+    cudaStreamSynchronize(stream_a);
     REQUIRE(h_output == h_reference);
   }
 }

@@ -29,6 +29,7 @@ endif()
 include(${CPM_DOWNLOAD_LOCATION})
 
 CPMAddPackage("gh:catchorg/Catch2@2.13.8")
+CPMAddPackage("gh:rapidsai/rmm@22.12.00")
 
 if(NOT DEFINED ${CMAKE_CUDA_ARCHITECTURES})
   set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures" FORCE)
@@ -39,8 +40,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ---- Create binary ----
 
-add_executable(stream-safety-tests examples.cu)
-target_link_libraries(stream-safety-tests Catch2)
+add_executable(stream-safety-tests examples.cu rmm_examples.cu)
+target_link_libraries(stream-safety-tests Catch2 rmm::rmm)
 target_compile_features(stream-safety-tests PRIVATE cxx_std_17)
 
 # ---- Enable testing ----
